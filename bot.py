@@ -1,10 +1,9 @@
 """
 GeBIZ Tender Alert Bot
-Uses data.gov.sg official open API — no blocking, no proxies needed.
-Free forever. Runs on GitHub Actions every 30 minutes.
+Uses data.gov.sg official open API — awarded contracts dataset.
+Filters for construction-related tenders and sends Telegram alerts.
 """
 import os, json, hashlib, logging, requests
-from datetime import datetime, timezone
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -14,15 +13,23 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 SEEN_FILE          = Path("seen_tenders.json")
 
-# data.gov.sg dataset ID for GeBIZ open tenders (Ministry of Finance, updated regularly)
 DATASET_ID = "d_acde1106003906a75c3fa052592f2fcb"
-API_URL    = f"https://data.gov.sg/api/action/datastore_search?resource_id={DATASET_ID}"
 
-# Keywords to filter — empty list [] = ALL tenders
-KEYWORDS: list[str] = []
+# ── Construction keywords — edit this list to customise what you get ──────────
+# Set to [] to receive ALL tenders from ALL industries
+KEYWORDS = [
+    "construction", "building", "civil", "structural", "M&E",
+    "mechanical", "electrical", "plumbing", "ACMV", "A&A",
+    "addition", "alteration", "renovation", "infrastructure",
+    "road", "drain", "waterworks", "sewerage", "piling",
+    "steel", "concrete", "earthwork", "demolition", "fitting out",
+    "interior", "facade", "roofing", "tiling", "painting",
+    "fire protection", "sprinkler", "lift", "escalator",
+    "landscape", "hardscape", "site", "works",
+]
 
-# Agencies to filter — empty list [] = ALL agencies
-FILTER_AGENCIES: list[str] = []
+# Minimum contract value in SGD — set to 0 for all values
+MIN_VALUE = 50000
 
 def load_seen() -> set:
     if SEEN_FILE.exists():
@@ -34,90 +41,94 @@ def save_seen(seen: set):
     SEEN_FILE.write_text(json.dumps(list(seen)))
 
 def tender_id(t: dict) -> str:
-    key = (t.get("tender_no","") + t.get("title","")).strip()
+    key = (t.get("tender_no","") + t.get("supplier_name","")).strip()
     return hashlib.md5(key.encode()).hexdigest()
 
 def fetch_tenders() -> list[dict]:
-    """Fetch latest tenders from data.gov.sg — sorted by most recent first."""
+    """Fetch latest 200 awarded tenders from data.gov.sg."""
     try:
-        # Get last 100 records, sorted by tender_no descending
-        params = {
-            "resource_id": DATASET_ID,
-            "limit": 100,
-            "sort": "tender_no desc",
-        }
         resp = requests.get(
             "https://data.gov.sg/api/action/datastore_search",
-            params=params,
+            params={"resource_id": DATASET_ID, "limit": 200, "sort": "_id desc"},
             timeout=30,
-            headers={"User-Agent": "GeBIZ-Alert-Bot/2.0"}
+            headers={"User-Agent": "Mozilla/5.0"}
         )
         resp.raise_for_status()
         data = resp.json()
-
         if not data.get("success"):
-            log.error("API returned success=false: %s", data)
-            return []
-
+            log.error("API error: %s", data); return []
         records = data.get("result", {}).get("records", [])
-        log.info("Fetched %d tenders from data.gov.sg", len(records))
+        log.info("Fetched %d records from data.gov.sg", len(records))
+        if records:
+            log.info("Field names: %s", list(records[0].keys()))
+            log.info("Sample: %s", records[0])
         return records
-
     except Exception as e:
-        log.error("Failed to fetch from data.gov.sg: %s", e)
-        return []
+        log.error("Fetch failed: %s", e); return []
+
+def get_field(t: dict, *keys) -> str:
+    """Try multiple field name variations, return first non-empty value."""
+    for k in keys:
+        v = t.get(k, "")
+        if v and str(v).strip() and str(v).strip().lower() not in ("none","null","n/a","-"):
+            return str(v).strip()
+    return ""
 
 def matches(t: dict) -> bool:
-    if FILTER_AGENCIES:
-        agency = t.get("agency","").lower()
-        if not any(a.lower() in agency for a in FILTER_AGENCIES):
-            return False
-    if KEYWORDS:
-        haystack = " ".join([t.get("title",""), t.get("description",""), t.get("category","")]).lower()
-        if not any(k.lower() in haystack for k in KEYWORDS):
-            return False
+    # Build searchable text from all fields
+    haystack = " ".join(str(v) for v in t.values()).lower()
+    # Keyword filter
+    if KEYWORDS and not any(kw.lower() in haystack for kw in KEYWORDS):
+        return False
+    # Minimum value filter
+    if MIN_VALUE > 0:
+        for field in ["awarded_amt","award_amt","contract_amount","amount"]:
+            val = t.get(field,"")
+            if val:
+                try:
+                    if float(str(val).replace(",","")) < MIN_VALUE:
+                        return False
+                    break
+                except: pass
     return True
 
 def fmt(t: dict) -> str:
-    # Pick emoji by tender category/type
-    category = t.get("category","").lower()
-    ttype    = t.get("tender_type","").lower()
-    if "construction" in category or "civil" in category or "building" in category:
-        icon = "🏗️"
-    elif "it" in category or "technology" in category or "software" in category:
-        icon = "💻"
-    elif "supply" in category or "goods" in category:
-        icon = "📦"
-    elif "service" in category or "consultancy" in category:
-        icon = "🔧"
-    else:
-        icon = "📋"
+    # Try all possible field name variations
+    title      = get_field(t, "description","tender_description","title","tender_title","subject")
+    tender_no  = get_field(t, "tender_no","tender_number","ref_no")
+    agency     = get_field(t, "agency","agency_name","ministry")
+    supplier   = get_field(t, "supplier_name","awarded_to","vendor","contractor")
+    value      = get_field(t, "awarded_amt","award_amt","contract_amount","amount")
+    award_date = get_field(t, "award_date","awarded_date","date")
+    tender_type= get_field(t, "tender_type","procurement_type","type")
 
-    # Format value
-    value = t.get("awarded_amt","") or t.get("budget","") or ""
     try:
-        value_str = f"S${float(value):,.0f}" if value else "Not disclosed"
+        value_str = f"S${float(str(value).replace(',','')):,.0f}" if value else "Not disclosed"
     except:
         value_str = value or "Not disclosed"
 
-    tender_no  = t.get("tender_no","N/A")
-    agency     = t.get("agency","N/A")
-    title      = t.get("title","N/A")
-    close_date = t.get("close_date","") or t.get("tender_close_date","") or "N/A"
-    status     = t.get("status","") or t.get("tender_status","")
+    # Pick emoji
+    haystack = (title + " " + tender_type).lower()
+    if any(w in haystack for w in ["construction","civil","building","drain","road","structural","infrastructure"]):
+        icon = "🏗️"
+    elif any(w in haystack for w in ["m&e","mechanical","electrical","plumbing","acmv","fire"]):
+        icon = "⚡"
+    elif any(w in haystack for w in ["renovation","interior","fitting","a&a","alteration"]):
+        icon = "🔨"
+    else:
+        icon = "📋"
 
     msg = (
-        f"{icon} *New GeBIZ Tender*\n\n"
-        f"📌 *{title}*\n\n"
-        f"🏢 Agency: {agency}\n"
-        f"🗂 Type: {t.get('tender_type','N/A')}\n"
-        f"💰 Value: {value_str}\n"
-        f"🔢 Tender No: `{tender_no}`\n"
-        f"⏰ Closing: {close_date}\n"
+        f"{icon} *New GeBIZ Award*\n\n"
+        f"📌 *{title or 'See tender reference'}*\n\n"
+        f"🏢 Agency: {agency or 'N/A'}\n"
+        f"🏆 Awarded To: {supplier or 'N/A'}\n"
+        f"💰 Contract Value: {value_str}\n"
+        f"🔢 Tender No: `{tender_no or 'N/A'}`\n"
+        f"📅 Award Date: {award_date or 'N/A'}\n"
+        f"🗂 Type: {tender_type or 'N/A'}\n"
+        f"\n🔗 [Search on GeBIZ](https://www.gebiz.gov.sg/ptn/opportunity/index.xhtml)"
     )
-    if status:
-        msg += f"📊 Status: {status}\n"
-    msg += f"\n🔗 [View on GeBIZ](https://www.gebiz.gov.sg)"
     return msg
 
 def send(msg: str) -> bool:
@@ -127,48 +138,35 @@ def send(msg: str) -> bool:
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True},
             timeout=15
         )
-        r.raise_for_status()
-        return True
+        r.raise_for_status(); return True
     except Exception as e:
-        log.error("Telegram failed: %s | %s", e, getattr(getattr(e,"response",None),"text",""))
-        return False
+        log.error("Telegram failed: %s", e); return False
 
 def run():
-    log.info("=== GeBIZ Bot (data.gov.sg API) starting ===")
+    log.info("=== GeBIZ Bot starting ===")
     seen = load_seen()
-    new_count = alert_count = 0
+    new_count = alert_count = skipped = 0
 
     tenders = fetch_tenders()
     if not tenders:
-        log.warning("No tenders returned from API")
-        # Send a diagnostic message to Telegram so you know it ran
-        send("ℹ️ GeBIZ Bot ran but got 0 results from data.gov.sg API. Will retry next cycle.")
-        return
-
-    # Log sample record so we can see field names
-    if tenders:
-        log.info("Sample record fields: %s", list(tenders[0].keys()))
-        log.info("Sample record: %s", tenders[0])
+        log.warning("No records from API"); return
 
     for t in tenders:
         tid = tender_id(t)
-        if tid in seen:
-            continue
-        seen.add(tid)
-        new_count += 1
+        if tid in seen: continue
+        seen.add(tid); new_count += 1
 
         if not matches(t):
-            log.info("Skipped (filter): %s", t.get("title",""))
+            skipped += 1
             continue
 
-        log.info("NEW: %s | %s", t.get("tender_no",""), t.get("title",""))
+        log.info("MATCH: %s", get_field(t,"description","tender_description","title") or t.get("tender_no",""))
         if send(fmt(t)):
-            alert_count += 1
-            log.info("Sent ✅")
+            alert_count += 1; log.info("Sent ✅")
         else:
             log.warning("Failed ❌")
 
     save_seen(seen)
-    log.info("Done. New:%d Alerted:%d Seen total:%d", new_count, alert_count, len(seen))
+    log.info("Done. New:%d Matched:%d Skipped:%d Seen total:%d", new_count, alert_count, skipped, len(seen))
 
 if __name__ == "__main__": run()
