@@ -1,15 +1,8 @@
 """
 GeBIZ Tender Alert Bot
-Monitors Singapore's GeBIZ RSS feed and sends Telegram alerts for new tenders.
-100% free to run - uses GitHub Actions + Telegram Bot API
+Fetches feed via a Singapore-based proxy (Render.com free tier).
 """
-
-import os
-import re
-import json
-import hashlib
-import logging
-import requests
+import os, re, json, hashlib, logging, requests
 from pathlib import Path
 
 try:
@@ -18,218 +11,119 @@ try:
 except ImportError:
     HAS_LXML = False
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
+# Set this to your Render.com app URL after deploying the proxy
+PROXY_BASE_URL     = os.environ.get("PROXY_BASE_URL", "").rstrip("/")
 SEEN_FILE          = Path("seen_tenders.json")
-
-GEBIZ_RSS_FEEDS = [
-    "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=ITQ",
-    "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=IFQ",
-    "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=RFP",
-]
-
-KEYWORDS: list[str] = []   # empty = ALL tenders
+KEYWORDS: list[str] = []
 FILTER_AGENCIES: list[str] = []
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/rss+xml, application/xml, text/xml, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.gebiz.gov.sg/",
-}
+def feed_urls():
+    if PROXY_BASE_URL:
+        log.info("Using proxy: %s", PROXY_BASE_URL)
+        return [
+            f"{PROXY_BASE_URL}/feed/ITQ",
+            f"{PROXY_BASE_URL}/feed/IFQ",
+            f"{PROXY_BASE_URL}/feed/RFP",
+        ]
+    # Fallback: direct (may be blocked outside SG)
+    log.warning("No PROXY_BASE_URL set — trying direct GeBIZ access")
+    return [
+        "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=ITQ",
+        "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=IFQ",
+        "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=RFP",
+    ]
 
-def load_seen() -> set:
+def load_seen():
     if SEEN_FILE.exists():
-        try:
-            return set(json.loads(SEEN_FILE.read_text()))
-        except Exception:
-            pass
+        try: return set(json.loads(SEEN_FILE.read_text()))
+        except: pass
     return set()
 
-def save_seen(seen: set) -> None:
-    SEEN_FILE.write_text(json.dumps(list(seen)))
+def save_seen(seen): SEEN_FILE.write_text(json.dumps(list(seen)))
 
-def tender_id(item: dict) -> str:
-    key = (item.get("ref", "") + item.get("title", "")).strip()
-    return hashlib.md5(key.encode()).hexdigest()
+def tender_id(item):
+    return hashlib.md5((item.get("ref","") + item.get("title","")).encode()).hexdigest()
 
-def _extract_tag(text: str, tag: str) -> str:
-    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", text, re.S | re.I)
+def _xtag(text, tag):
+    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", text, re.S|re.I)
     if m:
-        val = m.group(1).strip()
-        val = re.sub(r"^<!\[CDATA\[|\]\]>$", "", val).strip()
-        val = re.sub(r"<[^>]+>", " ", val).strip()
-        return val
+        v = re.sub(r"^<!\[CDATA\[|\]\]>$","",m.group(1).strip()).strip()
+        return re.sub(r"<[^>]+>"," ",v).strip()
     return ""
 
-def parse_feed(url: str) -> list[dict]:
+def parse_feed(url):
     try:
-        resp = requests.get(url, timeout=30, headers=HEADERS)
+        resp = requests.get(url, timeout=30, headers={"User-Agent":"Mozilla/5.0"})
         resp.raise_for_status()
-    except Exception as exc:
-        log.error("Failed to fetch %s: %s", url, exc)
-        return []
+    except Exception as e:
+        log.error("Fetch failed %s: %s", url, e); return []
 
     raw = resp.text
-    ct  = resp.headers.get("Content-Type", "?")
-    log.info("HTTP %s | Content-Type: %s | Length: %d chars", resp.status_code, ct, len(raw))
-    log.info("RAW PREVIEW: %.400s", raw.replace("\n", " "))
+    log.info("HTTP %s | CT: %s | Len: %d", resp.status_code, resp.headers.get("Content-Type","?"), len(raw))
+    log.info("PREVIEW: %.300s", raw.replace("\n"," "))
 
     tenders = []
-
-    # Strategy 1: lxml with recovery
     if HAS_LXML:
         try:
-            parser = LET.XMLParser(recover=True)
-            root = LET.fromstring(resp.content, parser=parser)
+            root = LET.fromstring(resp.content, LET.XMLParser(recover=True))
             items = root.findall(".//item")
-            log.info("lxml found %d <item> elements", len(items))
-            for item in items:
-                def gtag(t, _item=item):
-                    el = _item.find(t)
-                    if el is not None:
-                        txt = (el.text or "").strip()
-                        return re.sub(r"<[^>]+>", " ", txt).strip()
-                    return ""
-                tenders.append({
-                    "title":       gtag("title"),
-                    "link":        gtag("link"),
-                    "description": gtag("description"),
-                    "pubDate":     gtag("pubDate"),
-                    "ref":         gtag("refNo"),
-                    "agency":      gtag("agencyName"),
-                    "category":    gtag("procurementCategory"),
-                    "close_date":  gtag("closingDate"),
-                    "value":       gtag("estimatedValue"),
-                })
-            if tenders:
-                log.info("lxml parsed %d items OK", len(tenders))
-                return tenders
-            log.warning("lxml parsed 0 items — trying regex")
-        except Exception as exc:
-            log.warning("lxml failed: %s — trying regex", exc)
+            log.info("lxml found %d items", len(items))
+            for it in items:
+                def g(t,_i=it): el=_i.find(t); return re.sub(r"<[^>]+>"," ",(el.text or "").strip()).strip() if el is not None else ""
+                tenders.append({"title":g("title"),"link":g("link"),"description":g("description"),"pubDate":g("pubDate"),"ref":g("refNo"),"agency":g("agencyName"),"category":g("procurementCategory"),"close_date":g("closingDate"),"value":g("estimatedValue")})
+            if tenders: return tenders
+        except Exception as e:
+            log.warning("lxml failed: %s", e)
 
-    # Strategy 2: pure regex
-    item_blocks = re.split(r"<item[\s>]", raw, flags=re.I)[1:]
-    log.info("Regex found %d <item> splits", len(item_blocks))
-    for block in item_blocks:
-        end = block.find("</item>")
-        if end != -1:
-            block = block[:end]
-        tenders.append({
-            "title":       _extract_tag(block, "title"),
-            "link":        _extract_tag(block, "link"),
-            "description": _extract_tag(block, "description"),
-            "pubDate":     _extract_tag(block, "pubDate"),
-            "ref":         _extract_tag(block, "refNo"),
-            "agency":      _extract_tag(block, "agencyName"),
-            "category":    _extract_tag(block, "procurementCategory"),
-            "close_date":  _extract_tag(block, "closingDate"),
-            "value":       _extract_tag(block, "estimatedValue"),
-        })
-
-    log.info("Regex parsed %d items from %s", len(tenders), url)
+    blocks = re.split(r"<item[\s>]", raw, flags=re.I)[1:]
+    log.info("Regex found %d item blocks", len(blocks))
+    for b in blocks:
+        end = b.find("</item>")
+        if end != -1: b = b[:end]
+        tenders.append({k:_xtag(b,v) for k,v in [("title","title"),("link","link"),("description","description"),("pubDate","pubDate"),("ref","refNo"),("agency","agencyName"),("category","procurementCategory"),("close_date","closingDate"),("value","estimatedValue")]})
     return tenders
 
-def matches_filter(tender: dict) -> bool:
-    if FILTER_AGENCIES:
-        agency = tender.get("agency", "").lower()
-        if not any(a.lower() in agency for a in FILTER_AGENCIES):
-            return False
-    if KEYWORDS:
-        haystack = " ".join([
-            tender.get("title", ""),
-            tender.get("description", ""),
-            tender.get("category", ""),
-        ]).lower()
-        if not any(kw.lower() in haystack for kw in KEYWORDS):
-            return False
+def matches(t):
+    if FILTER_AGENCIES and not any(a.lower() in t.get("agency","").lower() for a in FILTER_AGENCIES): return False
+    if KEYWORDS and not any(k.lower() in (" ".join([t.get("title",""),t.get("description",""),t.get("category","")])).lower() for k in KEYWORDS): return False
     return True
 
-def format_message(tender: dict) -> str:
-    cat = tender.get("category", "").lower()
-    if "construction" in cat or "civil" in cat:
-        icon = "🏗️"
-    elif "supply" in cat or "goods" in cat:
-        icon = "📦"
-    elif "service" in cat:
-        icon = "🔧"
-    else:
-        icon = "📋"
-
-    value = tender.get("value", "")
-    try:
-        value_str = f"S${float(value):,.0f}" if value else "Not specified"
-    except ValueError:
-        value_str = value or "Not specified"
-
-    msg = (
-        f"{icon} *New GeBIZ Tender*\n\n"
-        f"📌 *{tender.get('title','N/A')}*\n\n"
-        f"🏢 Agency: {tender.get('agency','N/A')}\n"
-        f"🗂 Category: {tender.get('category','N/A')}\n"
-        f"💰 Est. Value: {value_str}\n"
-        f"🔢 Ref No: `{tender.get('ref','N/A')}`\n"
-        f"⏰ Closing: {tender.get('close_date','N/A')}\n"
-    )
-    link = tender.get("link", "")
-    if link:
-        msg += f"\n🔗 [View on GeBIZ]({link})"
+def fmt(t):
+    cat = t.get("category","").lower()
+    icon = "🏗️" if "construction" in cat or "civil" in cat else "📦" if "supply" in cat or "goods" in cat else "🔧" if "service" in cat else "📋"
+    try: vs = f"S${float(t.get('value','')or'x'):,.0f}"
+    except: vs = t.get("value","") or "Not specified"
+    msg = f"{icon} *New GeBIZ Tender*\n\n📌 *{t.get('title','N/A')}*\n\n🏢 Agency: {t.get('agency','N/A')}\n🗂 Category: {t.get('category','N/A')}\n💰 Est. Value: {vs}\n🔢 Ref No: `{t.get('ref','N/A')}`\n⏰ Closing: {t.get('close_date','N/A')}\n"
+    if t.get("link"): msg += f"\n🔗 [View on GeBIZ]({t['link']})"
     return msg
 
-def send_telegram(message: str) -> bool:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id":    TELEGRAM_CHAT_ID,
-        "text":       message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
-    }
+def send(msg):
     try:
-        resp = requests.post(url, json=payload, timeout=15)
-        resp.raise_for_status()
-        return True
-    except Exception as exc:
-        log.error("Telegram send failed: %s | response: %s", exc,
-                  getattr(exc, 'response', None) and exc.response.text)
-        return False
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"Markdown","disable_web_page_preview":False}, timeout=15)
+        r.raise_for_status(); return True
+    except Exception as e:
+        log.error("Telegram failed: %s", e); return False
 
 def run():
-    log.info("=== GeBIZ Tender Alert Bot starting ===")
+    log.info("=== GeBIZ Bot starting ===")
     seen = load_seen()
-    new_count = 0
-    alert_count = 0
-
-    for feed_url in GEBIZ_RSS_FEEDS:
-        tenders = parse_feed(feed_url)
-        for tender in tenders:
-            tid = tender_id(tender)
-            if tid in seen:
-                continue
-            seen.add(tid)
-            new_count += 1
-
-            if not matches_filter(tender):
-                log.info("Skipped (filter): %s", tender.get("title", ""))
-                continue
-
-            log.info("NEW tender: %s", tender.get("title", ""))
-            msg = format_message(tender)
-            if send_telegram(msg):
-                alert_count += 1
-                log.info("Alert sent ✅")
-            else:
-                log.warning("Alert failed ❌")
-
+    new_count = alert_count = 0
+    for url in feed_urls():
+        for t in parse_feed(url):
+            tid = tender_id(t)
+            if tid in seen: continue
+            seen.add(tid); new_count += 1
+            if not matches(t): log.info("Skipped: %s", t.get("title","")); continue
+            log.info("NEW: %s", t.get("title",""))
+            if send(fmt(t)): alert_count += 1; log.info("Sent ✅")
+            else: log.warning("Failed ❌")
     save_seen(seen)
-    log.info("Done. New: %d | Alerted: %d | Seen total: %d", new_count, alert_count, len(seen))
+    log.info("Done. New:%d Alerted:%d Seen:%d", new_count, alert_count, len(seen))
 
-if __name__ == "__main__":
-    run()
+if __name__ == "__main__": run()
