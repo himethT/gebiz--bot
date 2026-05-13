@@ -1,5 +1,13 @@
 """
-GeBIZ Proxy — scrapes the public open tender listing page.
+GeBIZ Proxy — parses open tender listing from GeBIZ Opportunities page.
+Each tender block follows this pattern in the HTML:
+  div.row -> "NQuotation - DOC_NO OPEN"  (header row)
+  div.formRow_MAIN -> title
+  formOutputText_MAIN (first) -> Agency: XXXX
+  formOutputText_MAIN (second) -> Published: DATE
+  div.form2_ROW -> Procurement Category: XXXX
+  div.form2_ROW-NO-PADDING-BOTTOM -> "Closing on"
+  div.form2_ROW-NO-PADDING-BOTTOM form2_ROW-NO-PADDING-TOP -> DATE TIME
 """
 from flask import Flask, jsonify
 import requests, re, os
@@ -17,69 +25,102 @@ HEADERS = {
 def fetch_html():
     s = requests.Session()
     s.get("https://www.gebiz.gov.sg/", headers=HEADERS, timeout=20)
-    r = s.get(LISTING_URL, headers={**HEADERS, "Referer": "https://www.gebiz.gov.sg/"}, timeout=20)
+    r = s.get(LISTING_URL, headers={**HEADERS, "Referer": "https://www.gebiz.gov.sg/"}, timeout=25)
     return r.text
+
+def parse_tenders(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    tenders = []
+
+    # Find all header rows that look like "NQuotation - DOC_NO OPEN" or "NTender - DOC_NO OPEN"
+    header_pattern = re.compile(r"^(\d+)(Quotation|Tender|Request for Proposal)\s*-\s*([^\s]+.*?)(OPEN|CLOSED)$", re.I)
+
+    all_rows = soup.find_all(class_="row")
+
+    for i, row in enumerate(all_rows):
+        text = row.get_text(strip=True)
+        m = header_pattern.match(text)
+        if not m:
+            continue
+
+        serial   = m.group(1)
+        doc_type = m.group(2)
+        doc_no   = m.group(3).strip()
+        status   = m.group(4)
+
+        # Now scan the next ~20 sibling/nearby rows to collect this tender's fields
+        tender = {
+            "serial":    serial,
+            "doc_type":  doc_type,
+            "doc_no":    doc_no,
+            "status":    status,
+            "title":     "",
+            "agency":    "",
+            "published": "",
+            "category":  "",
+            "closing":   "",
+            "link":      f"https://www.gebiz.gov.sg/ptn/opportunity/BOListing.xhtml?origin=menu",
+        }
+
+        # Look ahead in the flat list for the data rows belonging to this tender
+        for j in range(i+1, min(i+40, len(all_rows))):
+            nrow = all_rows[j]
+            ntext = nrow.get_text(strip=True)
+
+            # Stop when we hit the next tender header or separator
+            if header_pattern.match(ntext):
+                break
+            if "formLineSeparator" in " ".join(nrow.get("class", [])):
+                break
+
+            # Title — found in formRow_MAIN
+            classes = " ".join(nrow.get("class", []))
+            if "formRow_MAIN" in classes and not tender["title"]:
+                # Remove "LOADING" suffix
+                title = re.sub(r"LOADING.*$", "", ntext).strip()
+                if title and len(title) > 5:
+                    tender["title"] = title
+
+            # Agency
+            if ntext.startswith("Agency") and not tender["agency"]:
+                tender["agency"] = ntext.replace("Agency", "", 1).strip()
+
+            # Published date
+            if ntext.startswith("Published") and not tender["published"]:
+                tender["published"] = ntext.replace("Published", "", 1).strip()
+
+            # Procurement Category
+            if ntext.startswith("Procurement Category") and not tender["category"]:
+                tender["category"] = ntext.replace("Procurement Category", "", 1).strip()
+
+            # Closing date — two consecutive rows: "Closing on" then the date
+            if "form2_ROW-NO-PADDING-BOTTOM" in classes and "form2_ROW-NO-PADDING-TOP" in classes:
+                if not tender["closing"] and ntext:
+                    tender["closing"] = ntext.strip()
+
+        # Only add if we got at least a title
+        if tender["title"]:
+            tenders.append(tender)
+
+    return tenders
 
 @app.route("/health")
 def health():
     return "OK", 200
 
-@app.route("/structure")
-def structure():
-    """Dump all tag classes and IDs so we can find tender rows."""
-    html = fetch_html()
-    soup = BeautifulSoup(html, "lxml")
-    lines = []
-    lines.append(f"HTML length: {len(html)}")
-    lines.append(f"Title: {soup.title.string if soup.title else 'none'}\n")
-
-    # Find all tables
-    tables = soup.find_all("table")
-    lines.append(f"Tables found: {len(tables)}")
-    for i, t in enumerate(tables[:5]):
-        lines.append(f"  table[{i}] id={t.get('id','')} class={t.get('class','')}")
-        rows = t.find_all("tr")
-        lines.append(f"    rows: {len(rows)}")
-        if rows:
-            lines.append(f"    first row text: {rows[0].get_text(' | ',strip=True)[:200]}")
-            if len(rows) > 1:
-                lines.append(f"    second row text: {rows[1].get_text(' | ',strip=True)[:200]}")
-
-    # Find divs with "tender" or "opportunity" in class/id
-    lines.append("\nDivs with tender/opportunity/listing in class or id:")
-    for tag in soup.find_all(True):
-        cls = " ".join(tag.get("class", []))
-        tid = tag.get("id", "")
-        if any(w in (cls+tid).lower() for w in ["tender","opportunity","listing","result","row","item"]):
-            lines.append(f"  <{tag.name}> id='{tid}' class='{cls}' text_preview='{tag.get_text(strip=True)[:80]}'")
-
-    return "\n".join(lines), 200
-
 @app.route("/tenders")
 def get_tenders():
     try:
         html = fetch_html()
-        soup = BeautifulSoup(html, "lxml")
-        tenders = []
-
-        # Try every table row that has multiple cells
-        for row in soup.find_all("tr"):
-            cells = row.find_all(["td","th"])
-            if len(cells) >= 3:
-                texts = [c.get_text(strip=True) for c in cells]
-                # Skip header rows
-                if texts[0].lower() in ("no.","#","s/n","sr","sl"): continue
-                if "document" in texts[0].lower(): continue
-                link_tag = row.find("a", href=True)
-                link = ""
-                if link_tag:
-                    h = link_tag["href"]
-                    link = h if h.startswith("http") else f"https://www.gebiz.gov.sg{h}"
-                tenders.append({"cells": texts, "link": link})
-
-        return jsonify({"count": len(tenders), "tenders": tenders[:5], "html_len": len(html)})
+        tenders = parse_tenders(html)
+        return jsonify({
+            "success": True,
+            "count": len(tenders),
+            "tenders": tenders
+        })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        return jsonify({"success": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
 @app.route("/debug")
 def debug():
@@ -87,12 +128,13 @@ def debug():
         html = fetch_html()
         soup = BeautifulSoup(html, "lxml")
         title = soup.title.string if soup.title else "none"
-        # Show a 1000-char snippet from the middle where content usually is
-        mid = len(html)//2
+        tenders = parse_tenders(html)
+        sample = tenders[:3] if tenders else []
         return (
-            f"Length: {len(html)}\nTitle: {title}\n\n"
-            f"--- MID SNIPPET ({mid} to {mid+1500}) ---\n"
-            f"{html[mid:mid+1500]}"
+            f"Length: {len(html)}\nTitle: {title}\n"
+            f"Tenders parsed: {len(tenders)}\n\n"
+            f"Sample (first 3):\n" +
+            "\n---\n".join(str(t) for t in sample)
         ), 200
     except Exception as e:
         return f"Error: {e}", 500
