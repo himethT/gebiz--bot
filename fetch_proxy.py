@@ -1,14 +1,3 @@
-"""
-GeBIZ Proxy — parses open tender listing from GeBIZ Opportunities page.
-Each tender block follows this pattern in the HTML:
-  div.row -> "NQuotation - DOC_NO OPEN"  (header row)
-  div.formRow_MAIN -> title
-  formOutputText_MAIN (first) -> Agency: XXXX
-  formOutputText_MAIN (second) -> Published: DATE
-  div.form2_ROW -> Procurement Category: XXXX
-  div.form2_ROW-NO-PADDING-BOTTOM -> "Closing on"
-  div.form2_ROW-NO-PADDING-BOTTOM form2_ROW-NO-PADDING-TOP -> DATE TIME
-"""
 from flask import Flask, jsonify
 import requests, re, os
 from bs4 import BeautifulSoup
@@ -30,77 +19,86 @@ def fetch_html():
 
 def parse_tenders(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
+
+    # Use regex on raw HTML — more reliable than navigating BeautifulSoup tree
+    # Each tender block looks like:
+    # <...>NQuotation - DOC_NOOPEN<...>  (header)
+    # Then title, agency, published, category, closing spread across nearby divs
+
     tenders = []
 
-    # Find all header rows that look like "NQuotation - DOC_NO OPEN" or "NTender - DOC_NO OPEN"
-    header_pattern = re.compile(r"^(\d+)(Quotation|Tender|Request for Proposal)\s*-\s*([^\s]+.*?)(OPEN|CLOSED)$", re.I)
+    # Find all tender header divs using regex on raw HTML
+    # Pattern: digit(s) + (Quotation|Tender) + " - " + doc_no + "OPEN"
+    header_re = re.compile(
+        r'(\d+)(Quotation|Tender|Request for Proposal)\s*-\s*([A-Z0-9/_\-\. ]+?)(OPEN|CLOSED)',
+        re.I
+    )
 
-    all_rows = soup.find_all(class_="row")
+    # Extract all text nodes from divs with class "row" - just direct text, not children
+    all_divs = soup.find_all("div")
 
-    for i, row in enumerate(all_rows):
-        text = row.get_text(strip=True)
-        m = header_pattern.match(text)
-        if not m:
-            continue
+    i = 0
+    while i < len(all_divs):
+        div = all_divs[i]
+        # Get only direct text of this div (not children)
+        direct_text = "".join(t for t in div.strings if t.parent == div).strip()
+        # Also try full text for header detection
+        full_text = div.get_text(strip=True)
 
-        serial   = m.group(1)
-        doc_type = m.group(2)
-        doc_no   = m.group(3).strip()
-        status   = m.group(4)
+        m = header_re.search(full_text[:120])  # only check start of text
+        if m and "row" in " ".join(div.get("class", [])):
+            doc_no   = m.group(3).strip()
+            doc_type = m.group(2)
+            status   = m.group(4)
 
-        # Now scan the next ~20 sibling/nearby rows to collect this tender's fields
-        tender = {
-            "serial":    serial,
-            "doc_type":  doc_type,
-            "doc_no":    doc_no,
-            "status":    status,
-            "title":     "",
-            "agency":    "",
-            "published": "",
-            "category":  "",
-            "closing":   "",
-            "link":      f"https://www.gebiz.gov.sg/ptn/opportunity/BOListing.xhtml?origin=menu",
-        }
+            tender = {
+                "doc_no":    doc_no,
+                "doc_type":  doc_type,
+                "status":    status,
+                "title":     "",
+                "agency":    "",
+                "published": "",
+                "category":  "",
+                "closing":   "",
+            }
 
-        # Look ahead in the flat list for the data rows belonging to this tender
-        for j in range(i+1, min(i+40, len(all_rows))):
-            nrow = all_rows[j]
-            ntext = nrow.get_text(strip=True)
+            # Scan next 60 divs for this tender's fields
+            for j in range(i+1, min(i+60, len(all_divs))):
+                d = all_divs[j]
+                t = d.get_text(strip=True)
+                cls = " ".join(d.get("class", []))
 
-            # Stop when we hit the next tender header or separator
-            if header_pattern.match(ntext):
-                break
-            if "formLineSeparator" in " ".join(nrow.get("class", [])):
-                break
+                # Stop at next tender header
+                if header_re.search(t[:80]) and "row" in cls:
+                    break
 
-            # Title — found in formRow_MAIN
-            classes = " ".join(nrow.get("class", []))
-            if "formRow_MAIN" in classes and not tender["title"]:
-                # Remove "LOADING" suffix
-                title = re.sub(r"LOADING.*$", "", ntext).strip()
-                if title and len(title) > 5:
-                    tender["title"] = title
+                # Title: in formRow_MAIN, remove LOADING suffix
+                if "formRow_MAIN" in cls and not tender["title"]:
+                    title = re.sub(r"LOADING.*$", "", t).strip()
+                    if len(title) > 8:
+                        tender["title"] = title
 
-            # Agency
-            if ntext.startswith("Agency") and not tender["agency"]:
-                tender["agency"] = ntext.replace("Agency", "", 1).strip()
+                # Agency
+                if t.startswith("Agency") and len(t) > 7 and not tender["agency"]:
+                    tender["agency"] = t[6:].strip()
 
-            # Published date
-            if ntext.startswith("Published") and not tender["published"]:
-                tender["published"] = ntext.replace("Published", "", 1).strip()
+                # Published
+                if t.startswith("Published") and len(t) > 10 and not tender["published"]:
+                    tender["published"] = t[9:].strip()
 
-            # Procurement Category
-            if ntext.startswith("Procurement Category") and not tender["category"]:
-                tender["category"] = ntext.replace("Procurement Category", "", 1).strip()
+                # Category
+                if t.startswith("Procurement Category") and not tender["category"]:
+                    tender["category"] = t[20:].strip()
 
-            # Closing date — two consecutive rows: "Closing on" then the date
-            if "form2_ROW-NO-PADDING-BOTTOM" in classes and "form2_ROW-NO-PADDING-TOP" in classes:
-                if not tender["closing"] and ntext:
-                    tender["closing"] = ntext.strip()
+                # Closing date (the row that has BOTH NO-PADDING classes)
+                if "form2_ROW-NO-PADDING-BOTTOM" in cls and "form2_ROW-NO-PADDING-TOP" in cls:
+                    if t and not tender["closing"]:
+                        tender["closing"] = t
 
-        # Only add if we got at least a title
-        if tender["title"]:
-            tenders.append(tender)
+            if tender["title"]:
+                tenders.append(tender)
+
+        i += 1
 
     return tenders
 
@@ -113,11 +111,7 @@ def get_tenders():
     try:
         html = fetch_html()
         tenders = parse_tenders(html)
-        return jsonify({
-            "success": True,
-            "count": len(tenders),
-            "tenders": tenders
-        })
+        return jsonify({"success": True, "count": len(tenders), "tenders": tenders})
     except Exception as e:
         import traceback
         return jsonify({"success": False, "error": str(e), "trace": traceback.format_exc()}), 500
@@ -126,18 +120,15 @@ def get_tenders():
 def debug():
     try:
         html = fetch_html()
-        soup = BeautifulSoup(html, "lxml")
-        title = soup.title.string if soup.title else "none"
         tenders = parse_tenders(html)
-        sample = tenders[:3] if tenders else []
-        return (
-            f"Length: {len(html)}\nTitle: {title}\n"
-            f"Tenders parsed: {len(tenders)}\n\n"
-            f"Sample (first 3):\n" +
-            "\n---\n".join(str(t) for t in sample)
-        ), 200
+        sample = tenders[:5]
+        out = f"Tenders parsed: {len(tenders)}\n\n"
+        for t in sample:
+            out += f"---\nDoc: {t['doc_no']}\nTitle: {t['title']}\nAgency: {t['agency']}\nCategory: {t['category']}\nClosing: {t['closing']}\n"
+        return out, 200
     except Exception as e:
-        return f"Error: {e}", 500
+        import traceback
+        return f"Error: {e}\n\n{traceback.format_exc()}", 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
