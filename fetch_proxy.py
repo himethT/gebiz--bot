@@ -11,6 +11,11 @@ HEADERS = {
     "Accept-Language": "en-SG,en;q=0.9",
 }
 
+HEADER_RE = re.compile(
+    r'(\d+)(Quotation|Tender|Request for Proposal)\s*-\s*([A-Z0-9/_\-\. ]+?)(OPEN|CLOSED)',
+    re.I
+)
+
 def fetch_html():
     s = requests.Session()
     s.get("https://www.gebiz.gov.sg/", headers=HEADERS, timeout=20)
@@ -19,60 +24,45 @@ def fetch_html():
 
 def parse_tenders(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
-
-    # Use regex on raw HTML — more reliable than navigating BeautifulSoup tree
-    # Each tender block looks like:
-    # <...>NQuotation - DOC_NOOPEN<...>  (header)
-    # Then title, agency, published, category, closing spread across nearby divs
-
-    tenders = []
-
-    # Find all tender header divs using regex on raw HTML
-    # Pattern: digit(s) + (Quotation|Tender) + " - " + doc_no + "OPEN"
-    header_re = re.compile(
-        r'(\d+)(Quotation|Tender|Request for Proposal)\s*-\s*([A-Z0-9/_\-\. ]+?)(OPEN|CLOSED)',
-        re.I
-    )
-
-    # Extract all text nodes from divs with class "row" - just direct text, not children
     all_divs = soup.find_all("div")
+    tenders = []
+    seen_docs = set()
 
     i = 0
     while i < len(all_divs):
         div = all_divs[i]
-        # Get only direct text of this div (not children)
-        direct_text = "".join(t for t in div.strings if t.parent == div).strip()
-        # Also try full text for header detection
         full_text = div.get_text(strip=True)
+        m = HEADER_RE.search(full_text[:120])
 
-        m = header_re.search(full_text[:120])  # only check start of text
         if m and "row" in " ".join(div.get("class", [])):
             doc_no   = m.group(3).strip()
             doc_type = m.group(2)
             status   = m.group(4)
 
+            # Skip duplicates (same div appears multiple times in tree)
+            if doc_no in seen_docs:
+                i += 1
+                continue
+            seen_docs.add(doc_no)
+
             tender = {
-                "doc_no":    doc_no,
-                "doc_type":  doc_type,
-                "status":    status,
-                "title":     "",
-                "agency":    "",
-                "published": "",
-                "category":  "",
-                "closing":   "",
+                "doc_no": doc_no, "doc_type": doc_type, "status": status,
+                "title": "", "agency": "", "published": "",
+                "category": "", "closing": "",
             }
 
-            # Scan next 60 divs for this tender's fields
-            for j in range(i+1, min(i+60, len(all_divs))):
+            found_closing_on = False
+
+            for j in range(i+1, min(i+80, len(all_divs))):
                 d = all_divs[j]
                 t = d.get_text(strip=True)
                 cls = " ".join(d.get("class", []))
 
                 # Stop at next tender header
-                if header_re.search(t[:80]) and "row" in cls:
+                if HEADER_RE.search(t[:80]) and "row" in cls:
                     break
 
-                # Title: in formRow_MAIN, remove LOADING suffix
+                # Title
                 if "formRow_MAIN" in cls and not tender["title"]:
                     title = re.sub(r"LOADING.*$", "", t).strip()
                     if len(title) > 8:
@@ -90,10 +80,18 @@ def parse_tenders(html: str) -> list[dict]:
                 if t.startswith("Procurement Category") and not tender["category"]:
                     tender["category"] = t[20:].strip()
 
-                # Closing date (the row that has BOTH NO-PADDING classes)
-                if "form2_ROW-NO-PADDING-BOTTOM" in cls and "form2_ROW-NO-PADDING-TOP" in cls:
-                    if t and not tender["closing"]:
-                        tender["closing"] = t
+                # Closing date: look for "Closing on" marker first, then grab the next date value
+                if t == "Closing on":
+                    found_closing_on = True
+                    continue
+
+                if found_closing_on and not tender["closing"] and t:
+                    # Skip the row that just says "Closing on" again (duplicate divs)
+                    if t != "Closing on" and not t.startswith("Electronic"):
+                        # Format: "22 May 202601:00PM" -> clean it up
+                        closing = re.sub(r"(\d{4})(\d{2}:\d{2})", r"\1 \2", t)
+                        tender["closing"] = closing
+                        found_closing_on = False
 
             if tender["title"]:
                 tenders.append(tender)
@@ -121,10 +119,18 @@ def debug():
     try:
         html = fetch_html()
         tenders = parse_tenders(html)
-        sample = tenders[:5]
         out = f"Tenders parsed: {len(tenders)}\n\n"
-        for t in sample:
-            out += f"---\nDoc: {t['doc_no']}\nTitle: {t['title']}\nAgency: {t['agency']}\nCategory: {t['category']}\nClosing: {t['closing']}\n"
+        for t in tenders[:8]:
+            out += (
+                f"---\n"
+                f"Doc:      {t['doc_no']}\n"
+                f"Type:     {t['doc_type']}\n"
+                f"Title:    {t['title']}\n"
+                f"Agency:   {t['agency']}\n"
+                f"Category: {t['category']}\n"
+                f"Closing:  {t['closing']}\n"
+                f"Published:{t['published']}\n"
+            )
         return out, 200
     except Exception as e:
         import traceback
