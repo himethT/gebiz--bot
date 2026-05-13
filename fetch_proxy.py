@@ -1,5 +1,5 @@
 from flask import Flask, Response
-import requests, os
+import requests, os, time
 
 app = Flask(__name__)
 
@@ -9,28 +9,46 @@ GEBIZ_FEEDS = {
     "RFP": "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=RFP",
 }
 
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "en-SG,en-GB;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
+
 def fetch_with_session(feed_url: str):
-    """
-    GeBIZ requires a valid browser session cookie.
-    Step 1: visit homepage to get session cookie
-    Step 2: use that cookie to fetch the RSS feed
-    """
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-SG,en-GB;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
+    session.headers.update(BASE_HEADERS)
 
-    # Step 1: hit homepage to establish session + get cookies
-    session.get("https://www.gebiz.gov.sg/", timeout=20)
+    # Step 1: hit homepage
+    r0 = session.get("https://www.gebiz.gov.sg/", timeout=20,
+                     headers={**BASE_HEADERS, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"})
 
-    # Step 2: fetch the RSS feed with the session cookie
-    session.headers.update({
-        "Accept": "application/rss+xml, application/xml, text/xml, */*",
-        "Referer": "https://www.gebiz.gov.sg/",
-    })
-    resp = session.get(feed_url, timeout=20)
+    # Step 2: hit the opportunities listing page (like a real user would)
+    time.sleep(1)
+    session.get("https://www.gebiz.gov.sg/ptn/opportunity/index.xhtml", timeout=20,
+                headers={**BASE_HEADERS,
+                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                         "Referer": "https://www.gebiz.gov.sg/"})
+
+    # Step 3: fetch RSS with full browser-like headers
+    time.sleep(1)
+    resp = session.get(feed_url, timeout=20,
+                       headers={**BASE_HEADERS,
+                                "Accept": "application/rss+xml,application/xml,text/xml,*/*;q=0.8",
+                                "Referer": "https://www.gebiz.gov.sg/ptn/opportunity/index.xhtml",
+                                "Sec-Fetch-Dest": "empty",
+                                "Sec-Fetch-Mode": "cors",
+                                "Sec-Fetch-Site": "same-origin",
+                                "X-Requested-With": "XMLHttpRequest"})
     return resp
 
 @app.route("/health")
@@ -56,13 +74,22 @@ def debug_feed(feedtype):
         return "Unknown feed", 404
     try:
         r = fetch_with_session(url)
-        preview = r.text[:3000]
+        # Show title tag to understand what page we're getting
+        import re
+        title = re.search(r"<title>(.*?)</title>", r.text, re.I)
+        title_str = title.group(1) if title else "no title tag"
+        # Check if we got XML
+        is_xml = "<?xml" in r.text[:100] and "<item>" in r.text
+        item_count = r.text.count("<item>")
         return (
             f"Status: {r.status_code}\n"
             f"Content-Type: {r.headers.get('Content-Type')}\n"
             f"Length: {len(r.text)}\n"
-            f"Cookies: {dict(r.cookies)}\n\n"
-            f"{preview}"
+            f"Page title: {title_str}\n"
+            f"Is RSS XML: {is_xml}\n"
+            f"Item count: {item_count}\n"
+            f"Cookies: {list(r.cookies.keys())}\n\n"
+            f"--- FIRST 500 CHARS ---\n{r.text[:500]}"
         ), 200
     except Exception as e:
         return f"Error: {e}", 502
