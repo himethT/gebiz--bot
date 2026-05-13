@@ -1,0 +1,54 @@
+name: GeBIZ Tender Alert Bot
+
+on:
+  # Run every 30 minutes, 24/7 — completely free on GitHub Actions
+  schedule:
+    - cron: "*/30 * * * *"
+
+  # Also allow manual trigger from GitHub UI
+  workflow_dispatch:
+
+jobs:
+  check-tenders:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── 1. Checkout your repo ──────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ───────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Restore seen-tenders cache (so we don't re-alert) ──────────────
+      - name: Restore seen tenders cache
+        uses: actions/cache@v4
+        with:
+          path: seen_tenders.json
+          key: seen-tenders-${{ github.run_id }}
+          restore-keys: |
+            seen-tenders-
+
+      # ── 5. Run the bot ─────────────────────────────────────────────────────
+      - name: Run GeBIZ bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
+
+      # ── 6. Save updated seen-tenders cache ────────────────────────────────
+      - name: Save seen tenders cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: seen_tenders.json
+          key: seen-tenders-${{ github.run_id }}
