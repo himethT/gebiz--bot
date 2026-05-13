@@ -5,13 +5,19 @@ Monitors Singapore's GeBIZ RSS feed and sends Telegram alerts for new tenders.
 """
 
 import os
+import re
 import json
 import hashlib
 import logging
 import requests
-import xml.etree.ElementTree as ET
-from datetime import datetime
 from pathlib import Path
+
+try:
+    from lxml import etree as LET
+    HAS_LXML = True
+except ImportError:
+    import xml.etree.ElementTree as ET
+    HAS_LXML = False
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,7 +43,11 @@ GEBIZ_RSS_FEEDS = [
 ]
 
 # Keywords to filter (leave empty list [] to get ALL tenders)
-KEYWORDS = []
+KEYWORDS = [
+    "construction", "building", "civil", "structural", "M&E",
+    "mechanical", "electrical", "plumbing", "ACMV", "A&A",
+    "renovation", "infrastructure", "road", "drain", "waterworks",
+]
 
 # Agencies to filter (leave empty list [] to get ALL agencies)
 FILTER_AGENCIES: list[str] = []
@@ -65,6 +75,19 @@ def tender_id(item: dict) -> str:
     return hashlib.md5(key.encode()).hexdigest()
 
 
+def _extract_tag(text: str, tag: str) -> str:
+    """Extract first occurrence of <tag>...</tag> via regex (handles broken XML)."""
+    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", text, re.S | re.I)
+    if m:
+        val = m.group(1).strip()
+        # strip CDATA wrappers
+        val = re.sub(r"^<!\[CDATA\[|\]\]>$", "", val).strip()
+        # strip HTML tags from description
+        val = re.sub(r"<[^>]+>", " ", val).strip()
+        return val
+    return ""
+
+
 def parse_feed(url: str) -> list[dict]:
     """Fetch and parse one GeBIZ RSS feed. Returns list of tender dicts."""
     try:
@@ -74,34 +97,62 @@ def parse_feed(url: str) -> list[dict]:
         log.error("Failed to fetch %s: %s", url, exc)
         return []
 
-    try:
-        root = ET.fromstring(resp.content)
-    except ET.ParseError as exc:
-        log.error("Failed to parse XML from %s: %s", url, exc)
-        return []
-
-    ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
+    raw = resp.text
     tenders = []
 
-    for item in root.iter("item"):
-        def tag(t):
-            el = item.find(t)
-            return el.text.strip() if el is not None and el.text else ""
+    # ── Strategy 1: lxml tolerant XML parser ────────────────────────────────
+    if HAS_LXML:
+        try:
+            parser = LET.XMLParser(recover=True)
+            root = LET.fromstring(resp.content, parser=parser)
+            items = root.findall(".//item")
+            for item in items:
+                def tag(t):
+                    el = item.find(t)
+                    if el is not None:
+                        txt = (el.text or "").strip()
+                        txt = re.sub(r"<[^>]+>", " ", txt).strip()
+                        return txt
+                    return ""
+                tenders.append({
+                    "title":       tag("title"),
+                    "link":        tag("link"),
+                    "description": tag("description"),
+                    "pubDate":     tag("pubDate"),
+                    "ref":         tag("refNo"),
+                    "agency":      tag("agencyName"),
+                    "category":    tag("procurementCategory"),
+                    "close_date":  tag("closingDate"),
+                    "value":       tag("estimatedValue"),
+                })
+            if tenders:
+                log.info("lxml parsed %d items from %s", len(tenders), url)
+                return tenders
+        except Exception as exc:
+            log.warning("lxml parse failed (%s), falling back to regex", exc)
 
-        tender = {
-            "title":        tag("title"),
-            "link":         tag("link"),
-            "description":  tag("description"),
-            "pubDate":      tag("pubDate"),
-            "ref":          tag("refNo"),          # GeBIZ-specific tags
-            "agency":       tag("agencyName"),
-            "category":     tag("procurementCategory"),
-            "close_date":   tag("closingDate"),
-            "value":        tag("estimatedValue"),
-        }
-        tenders.append(tender)
+    # ── Strategy 2: regex fallback — always works on broken feeds ────────────
+    log.info("Using regex parser for %s", url)
+    # Split on <item> boundaries
+    item_blocks = re.split(r"<item[\s>]", raw, flags=re.I)[1:]  # drop content before first item
+    for block in item_blocks:
+        # End at </item>
+        end = block.find("</item>")
+        if end != -1:
+            block = block[:end]
+        tenders.append({
+            "title":       _extract_tag(block, "title"),
+            "link":        _extract_tag(block, "link"),
+            "description": _extract_tag(block, "description"),
+            "pubDate":     _extract_tag(block, "pubDate"),
+            "ref":         _extract_tag(block, "refNo"),
+            "agency":      _extract_tag(block, "agencyName"),
+            "category":    _extract_tag(block, "procurementCategory"),
+            "close_date":  _extract_tag(block, "closingDate"),
+            "value":       _extract_tag(block, "estimatedValue"),
+        })
 
-    log.info("Parsed %d items from %s", len(tenders), url)
+    log.info("Regex parsed %d items from %s", len(tenders), url)
     return tenders
 
 
