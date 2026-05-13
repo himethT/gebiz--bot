@@ -1,114 +1,98 @@
 """
 GeBIZ Proxy — scrapes the public open tender listing page.
-The BOListing page is publicly accessible HTML, no login needed.
-Deployed on Render.com Singapore region (free tier).
 """
-from flask import Flask, Response, jsonify
+from flask import Flask, jsonify
 import requests, re, os
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
 LISTING_URL = "https://www.gebiz.gov.sg/ptn/opportunity/BOListing.xhtml?origin=menu"
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-SG,en;q=0.9",
-    "Referer": "https://www.gebiz.gov.sg/",
 }
 
-def scrape_tenders():
-    session = requests.Session()
-    # Visit homepage first to get session cookies
-    session.get("https://www.gebiz.gov.sg/", headers=HEADERS, timeout=20)
-    # Now fetch the open tender listing
-    resp = session.get(LISTING_URL, headers={**HEADERS, "Referer": "https://www.gebiz.gov.sg/"}, timeout=20)
-    return resp.text, resp.status_code
-
-def parse_tenders(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    tenders = []
-
-    # GeBIZ listing rows — each tender is in a table row or list item
-    # Try multiple selectors to find tender rows
-    rows = (
-        soup.select("tr.tender-row") or
-        soup.select("div.opportunity-item") or
-        soup.select("table.listTable tr") or
-        soup.select(".dataTable tr") or
-        soup.select("tbody tr")
-    )
-
-    for row in rows:
-        cells = row.find_all(["td", "th"])
-        if len(cells) < 2:
-            continue
-        text = [c.get_text(strip=True) for c in cells]
-        # Skip header rows
-        if any(h in " ".join(text).lower() for h in ["document no", "title", "agency", "closing"]):
-            continue
-        if not any(text):
-            continue
-
-        # Try to extract links for tender detail URL
-        link = ""
-        a = row.find("a", href=True)
-        if a:
-            href = a["href"]
-            link = href if href.startswith("http") else f"https://www.gebiz.gov.sg{href}"
-
-        tenders.append({
-            "raw_cells": text,
-            "link": link,
-            "title": text[1] if len(text) > 1 else text[0],
-            "doc_no": text[0] if text else "",
-        })
-
-    return tenders
+def fetch_html():
+    s = requests.Session()
+    s.get("https://www.gebiz.gov.sg/", headers=HEADERS, timeout=20)
+    r = s.get(LISTING_URL, headers={**HEADERS, "Referer": "https://www.gebiz.gov.sg/"}, timeout=20)
+    return r.text
 
 @app.route("/health")
 def health():
     return "OK", 200
 
+@app.route("/structure")
+def structure():
+    """Dump all tag classes and IDs so we can find tender rows."""
+    html = fetch_html()
+    soup = BeautifulSoup(html, "lxml")
+    lines = []
+    lines.append(f"HTML length: {len(html)}")
+    lines.append(f"Title: {soup.title.string if soup.title else 'none'}\n")
+
+    # Find all tables
+    tables = soup.find_all("table")
+    lines.append(f"Tables found: {len(tables)}")
+    for i, t in enumerate(tables[:5]):
+        lines.append(f"  table[{i}] id={t.get('id','')} class={t.get('class','')}")
+        rows = t.find_all("tr")
+        lines.append(f"    rows: {len(rows)}")
+        if rows:
+            lines.append(f"    first row text: {rows[0].get_text(' | ',strip=True)[:200]}")
+            if len(rows) > 1:
+                lines.append(f"    second row text: {rows[1].get_text(' | ',strip=True)[:200]}")
+
+    # Find divs with "tender" or "opportunity" in class/id
+    lines.append("\nDivs with tender/opportunity/listing in class or id:")
+    for tag in soup.find_all(True):
+        cls = " ".join(tag.get("class", []))
+        tid = tag.get("id", "")
+        if any(w in (cls+tid).lower() for w in ["tender","opportunity","listing","result","row","item"]):
+            lines.append(f"  <{tag.name}> id='{tid}' class='{cls}' text_preview='{tag.get_text(strip=True)[:80]}'")
+
+    return "\n".join(lines), 200
+
 @app.route("/tenders")
 def get_tenders():
-    """Returns JSON list of open tenders scraped from GeBIZ listing page."""
     try:
-        html, status = scrape_tenders()
+        html = fetch_html()
+        soup = BeautifulSoup(html, "lxml")
+        tenders = []
 
-        # Debug: check what we got
-        is_login = "login" in html.lower() and len(html) < 30000
-        has_table = "listTable" in html or "dataTable" in html or "tbody" in html
-        title_match = re.search(r"<title>(.*?)</title>", html, re.I)
-        page_title = title_match.group(1) if title_match else "?"
+        # Try every table row that has multiple cells
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["td","th"])
+            if len(cells) >= 3:
+                texts = [c.get_text(strip=True) for c in cells]
+                # Skip header rows
+                if texts[0].lower() in ("no.","#","s/n","sr","sl"): continue
+                if "document" in texts[0].lower(): continue
+                link_tag = row.find("a", href=True)
+                link = ""
+                if link_tag:
+                    h = link_tag["href"]
+                    link = h if h.startswith("http") else f"https://www.gebiz.gov.sg{h}"
+                tenders.append({"cells": texts, "link": link})
 
-        tenders = parse_tenders(html)
-
-        return jsonify({
-            "success": True,
-            "count": len(tenders),
-            "page_title": page_title,
-            "html_length": len(html),
-            "has_table": has_table,
-            "tenders": tenders[:50]  # return up to 50
-        })
+        return jsonify({"count": len(tenders), "tenders": tenders[:5], "html_len": len(html)})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/debug")
 def debug():
-    """Returns raw HTML preview to diagnose what GeBIZ is returning."""
     try:
-        html, status = scrape_tenders()
-        title_match = re.search(r"<title>(.*?)</title>", html, re.I)
+        html = fetch_html()
+        soup = BeautifulSoup(html, "lxml")
+        title = soup.title.string if soup.title else "none"
+        # Show a 1000-char snippet from the middle where content usually is
+        mid = len(html)//2
         return (
-            f"Status: {status}\n"
-            f"Length: {len(html)}\n"
-            f"Title: {title_match.group(1) if title_match else 'none'}\n"
-            f"Has tbody: {'tbody' in html}\n"
-            f"Has listTable: {'listTable' in html}\n\n"
-            f"--- FIRST 1000 CHARS ---\n{html[:1000]}"
+            f"Length: {len(html)}\nTitle: {title}\n\n"
+            f"--- MID SNIPPET ({mid} to {mid+1500}) ---\n"
+            f"{html[mid:mid+1500]}"
         ), 200
     except Exception as e:
         return f"Error: {e}", 500
