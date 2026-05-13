@@ -43,6 +43,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROXY_BASE_URL:     ${{ secrets.PROXY_BASE_URL }}
         run: python bot.py
 
       # ── 6. Save updated seen-tenders cache ────────────────────────────────
