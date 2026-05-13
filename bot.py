@@ -37,11 +37,7 @@ GEBIZ_RSS_FEEDS = [
 ]
 
 # Keywords to filter (leave empty list [] to get ALL tenders)
-KEYWORDS = [
-    "construction", "building", "civil", "structural", "M&E",
-    "mechanical", "electrical", "plumbing", "ACMV", "A&A",
-    "renovation", "infrastructure", "road", "drain", "waterworks",
-]
+KEYWORDS = []
 
 # Agencies to filter (leave empty list [] to get ALL agencies)
 FILTER_AGENCIES: list[str] = []
