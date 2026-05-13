@@ -1,165 +1,174 @@
 """
-GeBIZ Tender Alert Bot — with Render free-tier wake-up support
+GeBIZ Tender Alert Bot
+Uses data.gov.sg official open API — no blocking, no proxies needed.
+Free forever. Runs on GitHub Actions every 30 minutes.
 """
-import os, re, json, hashlib, logging, requests, time
+import os, json, hashlib, logging, requests
+from datetime import datetime, timezone
 from pathlib import Path
-
-try:
-    from lxml import etree as LET
-    HAS_LXML = True
-except ImportError:
-    HAS_LXML = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
-PROXY_BASE_URL     = os.environ.get("PROXY_BASE_URL", "").rstrip("/")
 SEEN_FILE          = Path("seen_tenders.json")
+
+# data.gov.sg dataset ID for GeBIZ open tenders (Ministry of Finance, updated regularly)
+DATASET_ID = "d_acde1106003906a75c3fa052592f2fcb"
+API_URL    = f"https://data.gov.sg/api/action/datastore_search?resource_id={DATASET_ID}"
+
+# Keywords to filter — empty list [] = ALL tenders
 KEYWORDS: list[str] = []
+
+# Agencies to filter — empty list [] = ALL agencies
 FILTER_AGENCIES: list[str] = []
 
-def wake_proxy():
-    """Ping the proxy /health endpoint and wait for it to wake up (free tier sleeps)."""
-    if not PROXY_BASE_URL:
-        return
-    health_url = f"{PROXY_BASE_URL}/health"
-    log.info("Waking up proxy at %s ...", health_url)
-    for attempt in range(1, 7):  # try up to 6 times = 60 seconds max
-        try:
-            r = requests.get(health_url, timeout=15)
-            if r.status_code == 200:
-                log.info("Proxy is awake ✅ (attempt %d)", attempt)
-                return
-            log.info("Proxy returned %s, waiting...", r.status_code)
-        except Exception as e:
-            log.info("Proxy not ready yet (attempt %d): %s", attempt, e)
-        time.sleep(10)
-    log.warning("Proxy may still be waking up — proceeding anyway")
-
-def feed_urls():
-    if PROXY_BASE_URL:
-        return [
-            f"{PROXY_BASE_URL}/feed/ITQ",
-            f"{PROXY_BASE_URL}/feed/IFQ",
-            f"{PROXY_BASE_URL}/feed/RFP",
-        ]
-    log.warning("No PROXY_BASE_URL — trying direct GeBIZ (may be blocked)")
-    return [
-        "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=ITQ",
-        "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=IFQ",
-        "https://www.gebiz.gov.sg/rss/rssfeed?feedtype=RFP",
-    ]
-
-def load_seen():
+def load_seen() -> set:
     if SEEN_FILE.exists():
         try: return set(json.loads(SEEN_FILE.read_text()))
         except: pass
     return set()
 
-def save_seen(seen):
+def save_seen(seen: set):
     SEEN_FILE.write_text(json.dumps(list(seen)))
 
-def tender_id(item):
-    return hashlib.md5((item.get("ref","") + item.get("title","")).encode()).hexdigest()
+def tender_id(t: dict) -> str:
+    key = (t.get("tender_no","") + t.get("title","")).strip()
+    return hashlib.md5(key.encode()).hexdigest()
 
-def _xtag(text, tag):
-    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", text, re.S|re.I)
-    if m:
-        v = re.sub(r"^<!\[CDATA\[|\]\]>$", "", m.group(1).strip()).strip()
-        return re.sub(r"<[^>]+>", " ", v).strip()
-    return ""
-
-def parse_feed(url):
+def fetch_tenders() -> list[dict]:
+    """Fetch latest tenders from data.gov.sg — sorted by most recent first."""
     try:
-        # 90 second timeout — gives Render time if it's still waking
-        resp = requests.get(url, timeout=90, headers={"User-Agent": "Mozilla/5.0"})
+        # Get last 100 records, sorted by tender_no descending
+        params = {
+            "resource_id": DATASET_ID,
+            "limit": 100,
+            "sort": "tender_no desc",
+        }
+        resp = requests.get(
+            "https://data.gov.sg/api/action/datastore_search",
+            params=params,
+            timeout=30,
+            headers={"User-Agent": "GeBIZ-Alert-Bot/2.0"}
+        )
         resp.raise_for_status()
+        data = resp.json()
+
+        if not data.get("success"):
+            log.error("API returned success=false: %s", data)
+            return []
+
+        records = data.get("result", {}).get("records", [])
+        log.info("Fetched %d tenders from data.gov.sg", len(records))
+        return records
+
     except Exception as e:
-        log.error("Fetch failed %s: %s", url, e)
+        log.error("Failed to fetch from data.gov.sg: %s", e)
         return []
 
-    raw = resp.text
-    log.info("HTTP %s | CT: %s | Len: %d", resp.status_code, resp.headers.get("Content-Type","?"), len(raw))
-    log.info("PREVIEW: %.300s", raw.replace("\n"," "))
-
-    tenders = []
-    if HAS_LXML:
-        try:
-            root = LET.fromstring(resp.content, LET.XMLParser(recover=True))
-            items = root.findall(".//item")
-            log.info("lxml found %d items", len(items))
-            for it in items:
-                def g(t, _i=it):
-                    el = _i.find(t)
-                    return re.sub(r"<[^>]+>", " ", (el.text or "").strip()).strip() if el is not None else ""
-                tenders.append({
-                    "title": g("title"), "link": g("link"), "description": g("description"),
-                    "pubDate": g("pubDate"), "ref": g("refNo"), "agency": g("agencyName"),
-                    "category": g("procurementCategory"), "close_date": g("closingDate"), "value": g("estimatedValue"),
-                })
-            if tenders:
-                log.info("lxml parsed %d items OK", len(tenders))
-                return tenders
-        except Exception as e:
-            log.warning("lxml failed: %s", e)
-
-    blocks = re.split(r"<item[\s>]", raw, flags=re.I)[1:]
-    log.info("Regex found %d item blocks", len(blocks))
-    for b in blocks:
-        end = b.find("</item>")
-        if end != -1: b = b[:end]
-        tenders.append({k: _xtag(b, v) for k, v in [
-            ("title","title"),("link","link"),("description","description"),("pubDate","pubDate"),
-            ("ref","refNo"),("agency","agencyName"),("category","procurementCategory"),
-            ("close_date","closingDate"),("value","estimatedValue"),
-        ]})
-    log.info("Regex parsed %d items", len(tenders))
-    return tenders
-
-def matches(t):
-    if FILTER_AGENCIES and not any(a.lower() in t.get("agency","").lower() for a in FILTER_AGENCIES): return False
-    if KEYWORDS and not any(k.lower() in " ".join([t.get("title",""), t.get("description",""), t.get("category","")]).lower() for k in KEYWORDS): return False
+def matches(t: dict) -> bool:
+    if FILTER_AGENCIES:
+        agency = t.get("agency","").lower()
+        if not any(a.lower() in agency for a in FILTER_AGENCIES):
+            return False
+    if KEYWORDS:
+        haystack = " ".join([t.get("title",""), t.get("description",""), t.get("category","")]).lower()
+        if not any(k.lower() in haystack for k in KEYWORDS):
+            return False
     return True
 
-def fmt(t):
-    cat = t.get("category","").lower()
-    icon = "🏗️" if "construction" in cat or "civil" in cat else "📦" if "supply" in cat or "goods" in cat else "🔧" if "service" in cat else "📋"
-    try: vs = f"S${float(t.get('value','') or 'x'):,.0f}"
-    except: vs = t.get("value","") or "Not specified"
-    msg = f"{icon} *New GeBIZ Tender*\n\n📌 *{t.get('title','N/A')}*\n\n🏢 Agency: {t.get('agency','N/A')}\n🗂 Category: {t.get('category','N/A')}\n💰 Est. Value: {vs}\n🔢 Ref No: `{t.get('ref','N/A')}`\n⏰ Closing: {t.get('close_date','N/A')}\n"
-    if t.get("link"): msg += f"\n🔗 [View on GeBIZ]({t['link']})"
+def fmt(t: dict) -> str:
+    # Pick emoji by tender category/type
+    category = t.get("category","").lower()
+    ttype    = t.get("tender_type","").lower()
+    if "construction" in category or "civil" in category or "building" in category:
+        icon = "🏗️"
+    elif "it" in category or "technology" in category or "software" in category:
+        icon = "💻"
+    elif "supply" in category or "goods" in category:
+        icon = "📦"
+    elif "service" in category or "consultancy" in category:
+        icon = "🔧"
+    else:
+        icon = "📋"
+
+    # Format value
+    value = t.get("awarded_amt","") or t.get("budget","") or ""
+    try:
+        value_str = f"S${float(value):,.0f}" if value else "Not disclosed"
+    except:
+        value_str = value or "Not disclosed"
+
+    tender_no  = t.get("tender_no","N/A")
+    agency     = t.get("agency","N/A")
+    title      = t.get("title","N/A")
+    close_date = t.get("close_date","") or t.get("tender_close_date","") or "N/A"
+    status     = t.get("status","") or t.get("tender_status","")
+
+    msg = (
+        f"{icon} *New GeBIZ Tender*\n\n"
+        f"📌 *{title}*\n\n"
+        f"🏢 Agency: {agency}\n"
+        f"🗂 Type: {t.get('tender_type','N/A')}\n"
+        f"💰 Value: {value_str}\n"
+        f"🔢 Tender No: `{tender_no}`\n"
+        f"⏰ Closing: {close_date}\n"
+    )
+    if status:
+        msg += f"📊 Status: {status}\n"
+    msg += f"\n🔗 [View on GeBIZ](https://www.gebiz.gov.sg)"
     return msg
 
-def send(msg):
+def send(msg: str) -> bool:
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": False},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True},
             timeout=15
         )
         r.raise_for_status()
         return True
     except Exception as e:
-        log.error("Telegram failed: %s", e)
+        log.error("Telegram failed: %s | %s", e, getattr(getattr(e,"response",None),"text",""))
         return False
 
 def run():
-    log.info("=== GeBIZ Bot starting ===")
-    wake_proxy()   # wake Render free tier before fetching
+    log.info("=== GeBIZ Bot (data.gov.sg API) starting ===")
     seen = load_seen()
     new_count = alert_count = 0
-    for url in feed_urls():
-        for t in parse_feed(url):
-            tid = tender_id(t)
-            if tid in seen: continue
-            seen.add(tid); new_count += 1
-            if not matches(t): log.info("Skipped: %s", t.get("title","")); continue
-            log.info("NEW: %s", t.get("title",""))
-            if send(fmt(t)): alert_count += 1; log.info("Sent ✅")
-            else: log.warning("Failed ❌")
+
+    tenders = fetch_tenders()
+    if not tenders:
+        log.warning("No tenders returned from API")
+        # Send a diagnostic message to Telegram so you know it ran
+        send("ℹ️ GeBIZ Bot ran but got 0 results from data.gov.sg API. Will retry next cycle.")
+        return
+
+    # Log sample record so we can see field names
+    if tenders:
+        log.info("Sample record fields: %s", list(tenders[0].keys()))
+        log.info("Sample record: %s", tenders[0])
+
+    for t in tenders:
+        tid = tender_id(t)
+        if tid in seen:
+            continue
+        seen.add(tid)
+        new_count += 1
+
+        if not matches(t):
+            log.info("Skipped (filter): %s", t.get("title",""))
+            continue
+
+        log.info("NEW: %s | %s", t.get("tender_no",""), t.get("title",""))
+        if send(fmt(t)):
+            alert_count += 1
+            log.info("Sent ✅")
+        else:
+            log.warning("Failed ❌")
+
     save_seen(seen)
-    log.info("Done. New:%d Alerted:%d Seen:%d", new_count, alert_count, len(seen))
+    log.info("Done. New:%d Alerted:%d Seen total:%d", new_count, alert_count, len(seen))
 
 if __name__ == "__main__": run()
