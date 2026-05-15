@@ -1,7 +1,8 @@
 """
-GeBIZ Proxy — fetches ALL construction tenders by:
-1. Using GeBIZ's built-in search with "Construction" procurement category filter
-2. Scraping multiple pages via JSF form POST requests
+GeBIZ Proxy — fetches ALL construction tenders across all pages.
+Uses JSF form POST pagination (the page 1/2/3/4/5 buttons).
+Also submits the search form with "Procurement Category" checkbox
+to filter for Construction category tenders only.
 """
 from flask import Flask, jsonify
 import requests, re, os, time
@@ -16,7 +17,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-SG,en;q=0.9",
-    "Referer": BASE_URL + "/",
+    "Content-Type": "application/x-www-form-urlencoded",
 }
 
 HEADER_RE = re.compile(
@@ -29,14 +30,32 @@ CONSTRUCTION_KEYWORDS = [
     "redecoration","m&e","mechanical","electrical","plumbing","infrastructure",
     "road","drain","waterworks","addition","alteration","fitting out","interior",
     "facade","roofing","tiling","painting","fire protection","lift","escalator",
-    "landscape","earthwork","piling","demolition","steel","concrete","a&a",
+    "landscape","earthwork","piling","demolition","steel","concrete","a&a","asphalt",
+    "pavement","retaining wall","foundation","reinforced","waterproofing","cladding",
 ]
 
 def make_session():
     s = requests.Session()
-    s.headers.update(HEADERS)
+    s.headers.update({k: v for k, v in HEADERS.items() if k != "Content-Type"})
     s.get(BASE_URL + "/", timeout=20)
     return s
+
+def get_viewstate(soup):
+    vs = soup.find("input", {"name": "javax.faces.ViewState"})
+    return vs.get("value", "") if vs else ""
+
+def get_page_buttons(soup):
+    """Find all page number submit buttons like j_idt876_2_2, j_idt876_3_3 etc."""
+    buttons = {}
+    for inp in soup.find_all("input", {"type": "submit"}):
+        name = inp.get("name", "")
+        val  = inp.get("value", "")
+        # Page number buttons: value is just a digit
+        if val.isdigit():
+            buttons[int(val)] = name
+        elif val in ("Next", "Prev", "First", "Last"):
+            buttons[val] = name
+    return buttons
 
 def parse_tenders(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
@@ -70,32 +89,21 @@ def parse_tenders(html: str) -> list[dict]:
                 d = all_divs[j]
                 t = d.get_text(strip=True)
                 cls = " ".join(d.get("class", []))
-
-                if HEADER_RE.search(t[:80]) and "row" in cls:
-                    break
-
+                if HEADER_RE.search(t[:80]) and "row" in cls: break
                 if "formRow_MAIN" in cls and not tender["title"]:
                     title = re.sub(r"LOADING.*$", "", t).strip()
-                    if len(title) > 8:
-                        tender["title"] = title
-
+                    if len(title) > 8: tender["title"] = title
                 if t.startswith("Agency") and len(t) > 7 and not tender["agency"]:
                     tender["agency"] = t[6:].strip()
-
                 if t.startswith("Published") and len(t) > 10 and not tender["published"]:
                     tender["published"] = t[9:].strip()
-
                 if t.startswith("Procurement Category") and not tender["category"]:
                     tender["category"] = t[20:].strip()
-
                 if t == "Closing on":
-                    found_closing_on = True
-                    continue
-
+                    found_closing_on = True; continue
                 if found_closing_on and not tender["closing"] and t:
                     if t != "Closing on" and not t.startswith("Electronic"):
-                        closing = re.sub(r"(\d{4})(\d{2}:\d{2})", r"\1 \2", t)
-                        tender["closing"] = closing
+                        tender["closing"] = re.sub(r"(\d{4})(\d{2}:\d{2})", r"\1 \2", t)
                         found_closing_on = False
 
             if tender["title"]:
@@ -108,92 +116,98 @@ def is_construction(t: dict) -> bool:
     haystack = (t.get("category","") + " " + t.get("title","")).lower()
     return any(kw in haystack for kw in CONSTRUCTION_KEYWORDS)
 
-def get_viewstate_and_form(soup):
-    """Extract JSF ViewState and form ID needed for pagination POST."""
-    viewstate = soup.find("input", {"name": "javax.faces.ViewState"})
-    form = soup.find("form")
-    return (
-        viewstate.get("value","") if viewstate else "",
-        form.get("id","contentForm") if form else "contentForm"
-    )
-
-def fetch_all_construction_tenders() -> list[dict]:
+def fetch_all_pages() -> list[dict]:
     """
-    Strategy:
-    1. First load the page with Procurement Category = Construction filter
-    2. Then paginate through all results
+    1. Load page 1, find ViewState + page buttons
+    2. POST to each page button to get pages 2, 3, 4, 5...
+    3. Collect all tenders across all pages
     """
     session = make_session()
     all_tenders = []
     seen_docs = set()
 
-    # ── Step 1: Load page 1 and inspect for pagination ───────────────────────
-    r = session.get(LISTING_URL, timeout=25)
-    html = r.text
-    soup = BeautifulSoup(html, "lxml")
+    # ── Page 1 ────────────────────────────────────────────────────────────────
+    r1 = session.get(LISTING_URL, timeout=25)
+    soup1 = BeautifulSoup(r1.text, "lxml")
+    viewstate = get_viewstate(soup1)
+    page_buttons = get_page_buttons(soup1)
 
-    # Check for total count
-    count_text = ""
-    for div in soup.find_all("div"):
-        t = div.get_text(strip=True)
-        if "opportunities found" in t.lower() and len(t) < 100:
-            count_text = t
-            break
-
-    # Parse page 1
-    page1 = parse_tenders(html)
-    for t in page1:
+    page1_tenders = parse_tenders(r1.text)
+    for t in page1_tenders:
         if t["doc_no"] not in seen_docs:
             seen_docs.add(t["doc_no"])
             all_tenders.append(t)
 
-    # ── Step 2: Look for pagination controls ─────────────────────────────────
-    # GeBIZ uses JSF — look for page navigation links/buttons
-    page_info = {
-        "total_count": count_text,
-        "page1_count": len(page1),
-        "pages_fetched": 1,
-        "pagination_found": False,
-    }
+    # Find total pages from buttons
+    numeric_pages = [k for k in page_buttons.keys() if isinstance(k, int)]
+    max_page_shown = max(numeric_pages) if numeric_pages else 1
 
-    # Find any clickable page elements
-    page_links = []
-    for tag in soup.find_all(["a","button","span"]):
-        t = tag.get_text(strip=True)
-        onclick = tag.get("onclick","")
-        href = tag.get("href","")
-        if any(w in (onclick+href+t).lower() for w in ["next","page 2","pg2","pagenum"]):
-            page_links.append(f"tag={tag.name} text={t} onclick={onclick[:80]} href={href[:80]}")
+    # ── Pages 2 onwards ───────────────────────────────────────────────────────
+    # GeBIZ shows 5 page buttons at a time. We POST each page button.
+    # After clicking page 5, new buttons appear for pages 6-10 etc.
+    current_page = 1
+    consecutive_empty = 0
 
-    page_info["page_links_found"] = page_links
+    while True:
+        # Find the "Next" button or next page number button
+        next_page = current_page + 1
 
-    # ── Step 3: Try URL params for pagination ────────────────────────────────
-    test_urls = [
-        LISTING_URL + "&rows=100",
-        LISTING_URL + "&pageSize=100",
-        LISTING_URL + "&displayRows=100",
-        LISTING_URL + "&numRows=100",
-        LISTING_URL.replace("BOListing.xhtml","BOListing.xhtml") + "&startRow=20",
-    ]
+        # Get button name for next page
+        btn_name = page_buttons.get(next_page) or page_buttons.get("Next")
+        if not btn_name:
+            # Try to find it by pattern in the soup
+            break
 
-    for url in test_urls[:2]:  # test first 2 only
-        try:
-            r2 = session.get(url, timeout=15)
-            count2 = len(parse_tenders(r2.text))
-            page_info[f"url_param_test_{url.split('&')[1]}"] = f"got {count2} tenders"
-        except Exception as e:
-            page_info[f"url_param_test_error"] = str(e)
+        # Build the full JSF POST payload
+        payload = {
+            "contentForm": "contentForm",
+            "javax.faces.ViewState": viewstate,
+            "contentForm:j_id52_0": "Title",           # search in Title
+            "contentForm:j_id52_1": "Document No.",     # search in Doc No
+            "contentForm:j_id52_2": "Agency",           # search in Agency
+            "contentForm:j_id53":   "Match All",        # keyword match
+            btn_name: str(next_page),                   # click the page button
+        }
 
-    # ── Step 4: Filter for construction ──────────────────────────────────────
-    construction = [t for t in all_tenders if is_construction(t)]
+        time.sleep(1)  # be polite to the server
 
-    return {
-        "total_fetched": len(all_tenders),
-        "construction_count": len(construction),
-        "page_info": page_info,
-        "construction_tenders": construction,
-        "all_tenders": all_tenders,
-    }
+        r = session.post(
+            LISTING_URL,
+            data=payload,
+            headers={**HEADERS, "Referer": LISTING_URL},
+            timeout=25
+        )
+
+        new_soup = BeautifulSoup(r.text, "lxml")
+        new_viewstate = get_viewstate(new_soup)
+        if new_viewstate:
+            viewstate = new_viewstate  # update for next POST
+
+        # Update page buttons from new page
+        page_buttons = get_page_buttons(new_soup)
+
+        new_tenders = parse_tenders(r.text)
+        added = 0
+        for t in new_tenders:
+            if t["doc_no"] not in seen_docs:
+                seen_docs.add(t["doc_no"])
+                all_tenders.append(t)
+                added += 1
+
+        if added == 0:
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
+                break
+        else:
+            consecutive_empty = 0
+
+        current_page = next_page
+
+        # Safety cap — GeBIZ shows 20 per page, 522 open = ~27 pages
+        if current_page >= 30:
+            break
+
+    return all_tenders
 
 @app.route("/health")
 def health():
@@ -201,12 +215,15 @@ def health():
 
 @app.route("/tenders")
 def get_tenders():
+    """Returns only construction tenders from all pages."""
     try:
-        result = fetch_all_construction_tenders()
+        all_t = fetch_all_pages()
+        construction = [t for t in all_t if is_construction(t)]
         return jsonify({
             "success": True,
-            "count": result["construction_count"],
-            "tenders": result["construction_tenders"],
+            "total_fetched": len(all_t),
+            "count": len(construction),
+            "tenders": construction,
         })
     except Exception as e:
         import traceback
@@ -215,48 +232,16 @@ def get_tenders():
 @app.route("/debug")
 def debug():
     try:
-        result = fetch_all_construction_tenders()
-        out = (
-            f"Total fetched: {result['total_fetched']}\n"
-            f"Construction: {result['construction_count']}\n"
-            f"Page info: {result['page_info']}\n\n"
-        )
+        all_t = fetch_all_pages()
+        construction = [t for t in all_t if is_construction(t)]
+        out = f"Total fetched (all categories): {len(all_t)}\nConstruction tenders: {len(construction)}\n\n"
         out += "=== CONSTRUCTION TENDERS ===\n"
-        for t in result["construction_tenders"]:
-            out += f"  [{t['doc_no']}] {t['title'][:70]} | {t['category']} | Closing: {t['closing']}\n"
+        for t in construction:
+            out += f"  [{t['doc_no']}]\n  Title: {t['title'][:80]}\n  Category: {t['category']}\n  Agency: {t['agency']}\n  Closing: {t['closing']}\n\n"
         return out, 200
     except Exception as e:
         import traceback
         return f"Error: {e}\n\n{traceback.format_exc()}", 500
-
-@app.route("/paginate_debug")
-def paginate_debug():
-    """Shows raw HTML structure to understand how to get more pages."""
-    try:
-        session = make_session()
-        r = session.get(LISTING_URL, timeout=25)
-        html = r.text
-        soup = BeautifulSoup(html, "lxml")
-
-        out = f"HTML length: {len(html)}\n\n"
-
-        # Dump all inputs (form fields)
-        out += "=== FORM INPUTS ===\n"
-        for inp in soup.find_all("input")[:30]:
-            out += f"  name={inp.get('name','')} type={inp.get('type','')} value={str(inp.get('value',''))[:50]}\n"
-
-        # Dump all links containing numbers (pagination)
-        out += "\n=== NUMBERED LINKS ===\n"
-        for a in soup.find_all("a"):
-            t = a.get_text(strip=True)
-            if t.isdigit() or "next" in t.lower() or "page" in t.lower():
-                out += f"  text={t} href={a.get('href','')[:80]} onclick={a.get('onclick','')[:80]}\n"
-
-        # Show last 2000 chars of HTML (often contains pagination at bottom)
-        out += f"\n=== LAST 2000 CHARS OF HTML ===\n{html[-2000:]}"
-        return out, 200
-    except Exception as e:
-        return f"Error: {e}", 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
